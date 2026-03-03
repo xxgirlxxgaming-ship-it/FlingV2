@@ -5,8 +5,8 @@ local DISCORD_LINK = "https://discord.gg/BhXZzkPGYk" -- where players get key
     Key = "winter-2026"
     We build it in parts to avoid having the plain string in one place.
 ]]
-local _kA = {119, 105, 110, 116, 101, 114}   -- "winter"  (w i n t e r)
-local _kB = {45, 50, 48, 50, 54}             -- "-2026"  (- 2 0 2 6)
+local _kA = {119, 105, 110, 116, 101, 114}
+local _kB = {45, 50, 48, 50, 54}
 
 local function _d(list)
     local s = {}
@@ -17,16 +17,14 @@ local function _d(list)
 end
 
 local function _buildKey()
-    return _d(_kA) .. _d(_kB) -- "winter" .. "-2026"
+    return _d(_kA) .. _d(_kB) 
 end
 
 local REQUIRED_KEY = _buildKey()
 local SALT = "_D3S7"            -- extra salt for comparison
 
--- [NEW] File path for saving key (per game)
 local KEY_FILE = "destiny_key_" .. game.PlaceId .. ".txt"
 
--- Safe wrappers in case executor doesn't support file functions
 local function canUseFiles()
     return (typeof(isfile) == "function")
         and (typeof(writefile) == "function")
