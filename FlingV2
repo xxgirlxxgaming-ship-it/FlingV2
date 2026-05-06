@@ -1,56 +1,993 @@
--- LocalScript in StarterPlayer -> StarterPlayerScripts
-
-local Players = game:GetService("Players")
-local StarterGui = game:GetService("StarterGui")
-
-local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
+-- // Destiny Fling – Rayfield UI + Original SkidFling Logic + Touch Fling + Extras (No Aura + Configurable Keybinds)
 
 
-spawn(function()
-    while true do
-        print("Discounted - winter")
-        task.wait(1) -- once per second
+-- ////////////////////////////////////////////////////////////////
+-- //  SERVICES
+-- ////////////////////////////////////////////////////////////////
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local StarterGui        = game:GetService("StarterGui")
+local Workspace         = game:GetService("Workspace")
+local TeleportService   = game:GetService("TeleportService")
+local HttpService       = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService  = game:GetService("UserInputService")
+
+local Player = Players.LocalPlayer
+if not Player then
+    warn("[Destiny Fling] LocalPlayer not available.")
+    return
+end
+
+
+-- ////////////////////////////////////////////////////////////////
+-- //  CONFIG / GLOBALS
+-- ////////////////////////////////////////////////////////////////
+
+local DEBUG_LOG = false -- set true for verbose console logs
+
+local function dlog(...)
+    if DEBUG_LOG then
+        print("[Destiny Fling DEBUG]", ...)
+    end
+end
+
+getgenv().OldPos = nil
+getgenv().FPDH  = Workspace.FallenPartsDestroyHeight
+
+-- No more Rayfield persistence between servers
+local RAYFIELD_CONFIG_FOLDER = "winterhub"
+local RAYFIELD_CONFIG_FILE   = "destiny_fling_config"
+
+
+-- ////////////////////////////////////////////////////////////////
+-- //  SAFE NOTIFICATION WRAPPER
+-- ////////////////////////////////////////////////////////////////
+
+local function Message(Title, Text, Time)
+    local ok, err = pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title    = Title,
+            Text     = Text,
+            Duration = Time or 5,
+        })
+    end)
+
+    if not ok and DEBUG_LOG then
+        warn("[Destiny Fling] Notification failed:", err)
+    end
+end
+
+
+-- ////////////////////////////////////////////////////////////////
+-- //  RAYFIELD UI SETUP (KEY SYSTEM REMOVED)
+-- ////////////////////////////////////////////////////////////////
+
+local success, Rayfield = pcall(function()
+    return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+end)
+
+if not success or not Rayfield then
+    warn("[Destiny Fling] Failed to load Rayfield UI library.")
+    return
+end
+
+
+
+dlog("Rayfield loaded successfully")
+
+local Window = Rayfield:CreateWindow({
+    Name = "Destiny Fling",
+    Icon = 6031075938,
+
+    LoadingTitle    = "Destiny Fling",
+    LoadingSubtitle = "by @winter9305",
+    ShowText        = "Destiny - Winter",
+
+    Theme            = "Ocean",
+    ToggleUIKeybind  = "K", -- do not use K anywhere else for keybinds
+    DisableRayfieldPrompts  = false,
+    DisableBuildWarnings    = false,
+
+    ConfigurationSaving = {
+        Enabled    = true,
+        FolderName = RAYFIELD_CONFIG_FOLDER,
+        FileName   = RAYFIELD_CONFIG_FILE,
+    },
+
+    Discord = {
+        Enabled       = true,
+        Invite        = "BhXZzkPGYk",
+        RememberJoins = true,
+    },
+
+    -- Key system disabled
+    KeySystem = false,
+})
+
+-- Order: Main, Fling, Touch Fling, Keybinds, Necessities
+local MainTab        = Window:CreateTab("Main", 4483362458)
+local FlingTab       = Window:CreateTab("Fling", 4483362458)
+local TouchFlingTab  = Window:CreateTab("Touch Fling", 4483362458)
+local KeybindsTab    = Window:CreateTab("Keybinds", 4483362458)
+local NecessitiesTab = Window:CreateTab("Necessities", 4483362458)
+
+MainTab:CreateSection("Info")
+MainTab:CreateParagraph({
+    Title   = "Destiny Fling",
+    Content = "Made by @winter9305\nToggle the UI with the 'K' key. Join the Discord for updates and support.",
+})
+
+
+-- ////////////////////////////////////////////////////////////////
+-- //  SIMPLE STATE & HELPERS (MAIN FLING)
+-- ////////////////////////////////////////////////////////////////
+
+local SelectedTargets    = {}
+local FlingActive        = false
+local AutoSelectEnabled  = false
+
+local PlayerFilterText   = ""
+local PlayerDropdown
+
+local FlingStrength      = 2.0   -- from slider
+local FlingDuration      = 2.5   -- from slider
+
+-- for advanced status panel
+local TotalFlingCycles   = 0
+local LastFlingTime      = 0
+
+local AntiAFK_Connection = nil
+local AntiAFK_Enabled    = false
+
+local function CountSelectedTargets()
+    local count = 0
+    for _ in pairs(SelectedTargets) do
+        count += 1
+    end
+    return count
+end
+
+local function ci_contains(haystack, needle)
+    haystack = string.lower(haystack or "")
+    needle   = string.lower(needle or "")
+    if needle == "" then return true end
+    return string.find(haystack, needle, 1, true) ~= nil
+end
+
+local function MatchesFilter(plr)
+    if PlayerFilterText == "" then return true end
+    local uname = plr.Name or ""
+    local dname = plr.DisplayName or ""
+    return ci_contains(uname, PlayerFilterText) or ci_contains(dname, PlayerFilterText)
+end
+
+local function GetPlayerNames()
+    local names = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= Player and MatchesFilter(plr) then
+            table.insert(names, plr.Name)
+        end
+    end
+    table.sort(names, function(a, b)
+        return a:lower() < b:lower()
+    end)
+    return names
+end
+
+
+-- ////////////////////////////////////////////////////////////////
+-- //  ADVANCED FLING STATUS PANEL
+-- ////////////////////////////////////////////////////////////////
+
+FlingTab:CreateSection("Fling Status")
+
+local Status_StateLabel    = FlingTab:CreateLabel("State: IDLE")
+local Status_TargetsLabel  = FlingTab:CreateLabel("Targets Selected: 0")
+local Status_CyclesLabel   = FlingTab:CreateLabel("Fling Cycles: 0")
+local Status_LastLabel     = FlingTab:CreateLabel("Last Fling: Never")
+local Status_SettingsLabel = FlingTab:CreateLabel("Settings → Strength: 2.0 | Duration: 2.5s")
+
+local function FormatTimeSince(t)
+    if t == 0 then return "Never" end
+    local diff = os.time() - t
+    if diff < 1 then return "Just now" end
+    if diff < 60 then return diff .. "s ago" end
+    local mins = math.floor(diff / 60)
+    if mins < 60 then return mins .. "m ago" end
+    local hrs = math.floor(mins / 60)
+    return hrs .. "h ago"
+end
+
+local function UpdateFlingStatus()
+    local count = CountSelectedTargets()
+    local state = FlingActive and "RUNNING" or "IDLE"
+
+    Status_StateLabel:Set("State: " .. state .. (FlingActive and "  |  Mode: Multi-Target" or ""))
+    Status_TargetsLabel:Set("Targets Selected: " .. tostring(count))
+    Status_CyclesLabel:Set("Fling Cycles: " .. tostring(TotalFlingCycles))
+    Status_LastLabel:Set("Last Fling: " .. FormatTimeSince(LastFlingTime))
+    Status_SettingsLabel:Set(string.format("Settings → Strength: %.1f | Duration: %.1fs", FlingStrength, FlingDuration))
+end
+
+
+-- ////////////////////////////////////////////////////////////////
+-- //  FLING CONTROLS (SLIDERS)
+-- ////////////////////////////////////////////////////////////////
+
+FlingTab:CreateSection("Fling Controls")
+
+FlingTab:CreateSlider({
+    Name         = "Fling Strength",
+    Range        = {0.5, 5},
+    Increment    = 0.1,
+    CurrentValue = 2.0,
+    Flag         = "DestinyFlingStrength",
+    Callback     = function(Value)
+        FlingStrength = Value
+        UpdateFlingStatus()
+    end,
+})
+
+FlingTab:CreateSlider({
+    Name         = "Fling Duration (s)",
+    Range        = {0.5, 6},
+    Increment    = 0.5,
+    CurrentValue = 2.5,
+    Flag         = "DestinyFlingDuration",
+    Callback     = function(Value)
+        FlingDuration = Value
+        UpdateFlingStatus()
+    end,
+})
+
+
+-- ////////////////////////////////////////////////////////////////
+-- //  TARGET PICKER
+-- ////////////////////////////////////////////////////////////////
+
+FlingTab:CreateInput({
+    Name                     = "Player Filter (User + Display)",
+    PlaceholderText          = "Type to filter players...",
+    RemoveTextAfterFocusLost = false,
+    Callback                 = function(Text)
+        PlayerFilterText = tostring(Text or "")
+
+        if PlayerDropdown then
+            local options = GetPlayerNames()
+            PlayerDropdown:Refresh(options)
+
+            local newSelected = {}
+            local toSet       = {}
+            for name, plr in pairs(SelectedTargets) do
+                if plr and plr.Parent and MatchesFilter(plr) then
+                    newSelected[name] = plr
+                    table.insert(toSet, name)
+                end
+            end
+            SelectedTargets = newSelected
+            PlayerDropdown:Set(toSet)
+        end
+
+        UpdateFlingStatus()
+    end,
+})
+
+PlayerDropdown = FlingTab:CreateDropdown({
+    Name            = "Target Players",
+    Options         = GetPlayerNames(),
+    CurrentOption   = {},
+    MultipleOptions = true,
+    Flag            = "DestinyFlingTargets",
+    Callback        = function(Options)
+        SelectedTargets = {}
+        for _, name in ipairs(Options) do
+            local plr = Players:FindFirstChild(name)
+            if plr then
+                SelectedTargets[name] = plr
+            end
+        end
+        UpdateFlingStatus()
+    end,
+})
+
+FlingTab:CreateButton({
+    Name     = "Select All (Filtered)",
+    Callback = function()
+        local options = GetPlayerNames()
+        SelectedTargets = {}
+        for _, name in ipairs(options) do
+            local plr = Players:FindFirstChild(name)
+            if plr then
+                SelectedTargets[name] = plr
+            end
+        end
+        if PlayerDropdown then
+            PlayerDropdown:Set(options)
+        end
+        UpdateFlingStatus()
+    end,
+})
+
+FlingTab:CreateButton({
+    Name     = "Deselect All",
+    Callback = function()
+        SelectedTargets = {}
+        if PlayerDropdown then
+            PlayerDropdown:Set({})
+        end
+        UpdateFlingStatus()
+    end,
+})
+
+
+-- ////////////////////////////////////////////////////////////////
+-- //  AUTO SELECTION (FUNCTIONAL + AUTO-FLING)
+-- ////////////////////////////////////////////////////////////////
+
+FlingTab:CreateSection("Auto Selection")
+
+FlingTab:CreateToggle({
+    Name         = "Auto-select New Players (Filtered)",
+    CurrentValue = false,
+    Flag         = "DestinyFlingAutoSelect",
+    Callback     = function(Value)
+        AutoSelectEnabled = Value
+        UpdateFlingStatus()
+    end,
+})
+
+local function RefreshDropdownKeepSelection()
+    if not PlayerDropdown then return end
+
+    local options = GetPlayerNames()
+    PlayerDropdown:Refresh(options)
+
+    local selectedNames = {}
+    local cleaned = {}
+
+    for name, plr in pairs(SelectedTargets) do
+        if plr and plr.Parent and MatchesFilter(plr) then
+            cleaned[name] = plr
+            table.insert(selectedNames, name)
+        end
+    end
+
+    SelectedTargets = cleaned
+    PlayerDropdown:Set(selectedNames)
+end
+
+local function AutoSelectPlayer(plr)
+    if not AutoSelectEnabled then return end
+    if plr == Player then return end
+    if not MatchesFilter(plr) then return end
+
+    SelectedTargets[plr.Name] = plr
+
+    RefreshDropdownKeepSelection()
+    UpdateFlingStatus()
+
+    if FlingActive then
+        task.spawn(function()
+            SkidFling(plr)
+        end)
+    end
+end
+
+Players.PlayerAdded:Connect(function(plr)
+    RefreshDropdownKeepSelection()
+    AutoSelectPlayer(plr)
+end)
+
+Players.PlayerRemoving:Connect(function(removing)
+    if SelectedTargets[removing.Name] then
+        SelectedTargets[removing.Name] = nil
+    end
+    RefreshDropdownKeepSelection()
+    UpdateFlingStatus()
+end)
+
+
+-- ////////////////////////////////////////////////////////////////
+-- //  ORIGINAL SKID FLING LOGIC (UNCHANGED)
+-- ////////////////////////////////////////////////////////////////
+
+local function SkidFling(TargetPlayer)
+    if not TargetPlayer or typeof(TargetPlayer) ~= "Instance" or not TargetPlayer:IsA("Player") then
+        return
+    end
+
+    local Character = Player.Character
+    local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+    local RootPart = Humanoid and Humanoid.RootPart
+    local TCharacter = TargetPlayer.Character
+    if not TCharacter then return end
+
+    local THumanoid
+    local TRootPart
+    local THead
+    local Accessory
+    local Handle
+
+    if TCharacter:FindFirstChildOfClass("Humanoid") then
+        THumanoid = TCharacter:FindFirstChildOfClass("Humanoid")
+    end
+    if THumanoid and THumanoid.RootPart then
+        TRootPart = THumanoid.RootPart
+    end
+    if TCharacter:FindFirstChild("Head") then
+        THead = TCharacter.Head
+    end
+    if TCharacter:FindFirstChildOfClass("Accessory") then
+        Accessory = TCharacter:FindFirstChildOfClass("Accessory")
+    end
+    if Accessory and Accessory:FindFirstChild("Handle") then
+        Handle = Accessory.Handle
+    end
+
+    if Character and Humanoid and RootPart then
+        if RootPart.Velocity.Magnitude < 50 then
+            getgenv().OldPos = RootPart.CFrame
+        end
+
+        if THumanoid and THumanoid.Sit then
+            return Message("Error", TargetPlayer.Name .. " is sitting", 2)
+        end
+
+        if THead then
+            Workspace.CurrentCamera.CameraSubject = THead
+        elseif Handle then
+            Workspace.CurrentCamera.CameraSubject = Handle
+        elseif THumanoid and TRootPart then
+            Workspace.CurrentCamera.CameraSubject = THumanoid
+        end
+
+        if not TCharacter:FindFirstChildWhichIsA("BasePart") then
+            return
+        end
+
+        local baseLin = 9e7 * FlingStrength
+        local baseAng = 9e8 * FlingStrength
+
+        local function FPos(BasePart, Pos, Ang)
+            RootPart.CFrame = CFrame.new(BasePart.Position) * Pos * Ang
+            Character:SetPrimaryPartCFrame(CFrame.new(BasePart.Position) * Pos * Ang)
+            RootPart.Velocity = Vector3.new(baseLin, baseLin * 10, baseLin)
+            RootPart.RotVelocity = Vector3.new(baseAng, baseAng, baseAng)
+        end
+
+        local function SFBasePart(BasePart)
+            local TimeToWait = FlingDuration
+            local TimeNow = tick()
+            local Angle = 0
+            repeat
+                if RootPart and THumanoid then
+                    if BasePart.Velocity.Magnitude < 50 then
+                        Angle = Angle + 100
+                        FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                        task.wait()
+                        FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                        task.wait()
+                        FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                        task.wait()
+                        FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                        task.wait()
+                        FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0))
+                        task.wait()
+                        FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0))
+                        task.wait()
+                    else
+                        FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0))
+                        task.wait()
+                        FPos(BasePart, CFrame.new(0, -1.5, -THumanoid.WalkSpeed), CFrame.Angles(0, 0, 0))
+                        task.wait()
+                        FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0))
+                        task.wait()
+
+                        FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(90), 0, 0))
+                        task.wait()
+                        FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(0, 0, 0))
+                        task.wait()
+                        FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(90), 0, 0))
+                        task.wait()
+                        FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(0, 0, 0))
+                        task.wait()
+                    end
+                end
+            until TimeNow + TimeToWait < tick() or not FlingActive
+        end
+
+        getgenv().FPDH = Workspace.FallenPartsDestroyHeight
+        Workspace.FallenPartsDestroyHeight = 0/0
+
+        local BV = Instance.new("BodyVelocity")
+        BV.Parent = RootPart
+        BV.Velocity = Vector3.new(0, 0, 0)
+        BV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+
+        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+
+        if TRootPart then
+            SFBasePart(TRootPart)
+        elseif THead then
+            SFBasePart(THead)
+        elseif Handle then
+            SFBasePart(Handle)
+        else
+            return Message("Error", TargetPlayer.Name .. " has no valid parts", 2)
+        end
+
+        BV:Destroy()
+        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, true)
+        Workspace.CurrentCamera.CameraSubject = Humanoid
+
+        if getgenv().OldPos then
+            repeat
+                RootPart.CFrame = getgenv().OldPos * CFrame.new(0, 0.5, 0)
+                Player.Character:SetPrimaryPartCFrame(getgenv().OldPos * CFrame.new(0, 0.5, 0))
+                Humanoid:ChangeState("GettingUp")
+                for _, part in pairs(Player.Character:GetChildren()) do
+                    if part:IsA("BasePart") then
+                        part.Velocity, part.RotVelocity = Vector3.new(), Vector3.new()
+                    end
+                end
+                task.wait()
+            until (RootPart.Position - getgenv().OldPos.Position).Magnitude < 25
+            Workspace.FallenPartsDestroyHeight = getgenv().FPDH
+        end
+    else
+        return Message("Error", "Your character is not ready", 2)
+    end
+end
+
+
+-- ////////////////////////////////////////////////////////////////
+-- //  START / STOP FLING
+-- ////////////////////////////////////////////////////////////////
+
+local function StartFling()
+    if FlingActive then return end
+
+    local count = CountSelectedTargets()
+    if count == 0 then
+        Message("Destiny Fling", "No targets selected!", 2)
+        UpdateFlingStatus()
+        return
+    end
+
+    FlingActive = true
+    TotalFlingCycles = 0
+    UpdateFlingStatus()
+    Message("Started", "Winter's Multi-Person Fling: flinging " .. count .. " target(s)", 2)
+
+    task.spawn(function()
+        while FlingActive do
+            local validTargets = {}
+
+            for name, plr in pairs(SelectedTargets) do
+                if plr and plr.Parent then
+                    validTargets[name] = plr
+                else
+                    SelectedTargets[name] = nil
+                end
+            end
+
+            if next(validTargets) ~= nil then
+                TotalFlingCycles += 1
+                LastFlingTime = os.time()
+            end
+
+            for _, plr in pairs(validTargets) do
+                if not FlingActive then break end
+                SkidFling(plr)
+                task.wait(0.1)
+            end
+
+            UpdateFlingStatus()
+            task.wait(0.5)
+        end
+    end)
+end
+
+local function StopFling()
+    if not FlingActive then return end
+
+    FlingActive = false
+    UpdateFlingStatus()
+    Message("Stopped", "Winter's Multi-Person Fling has been stopped", 2)
+end
+
+FlingTab:CreateButton({
+    Name     = "Start Fling",
+    Callback = function()
+        StartFling()
+    end,
+})
+
+FlingTab:CreateButton({
+    Name     = "Stop Fling",
+    Callback = function()
+        StopFling()
+    end,
+})
+
+
+-- ////////////////////////////////////////////////////////////////
+-- //  TOUCH FLING TAB (UNCAPPED)
+-- ////////////////////////////////////////////////////////////////
+
+TouchFlingTab:CreateSection("Touch Fling Controls")
+
+local TouchFlingEnabled = false
+local TouchFlingConnection
+
+local TouchFlingStrength = 1.0 -- default multiplier
+
+local function parseTouchStrength(Text)
+    Text = tostring(Text or ""):lower():gsub("%s+", "")
+    if Text == "inf" or Text == "infinity" or Text == "+inf" or Text == "-inf" then
+        return math.huge
+    end
+    local n = tonumber(Text)
+    if not n or n <= 0 then
+        return nil
+    end
+    return n
+end
+
+TouchFlingTab:CreateInput({
+    Name                     = "Touch Fling Strength",
+    PlaceholderText          = "Type a strength (e.g. 1, 2.5, 5, inf)",
+    RemoveTextAfterFocusLost = false,
+    Callback                 = function(Text)
+        local num = parseTouchStrength(Text)
+        if not num then
+            Message("Touch Fling", "Invalid strength value. Please type a positive number or 'inf'.", 3)
+            return
+        end
+
+        TouchFlingStrength = num
+        if num == math.huge then
+            Message("Touch Fling", "Strength set to infinity.", 3)
+        else
+            Message("Touch Fling", "Strength set to " .. tostring(num), 2)
+        end
+    end,
+})
+
+-- Touch Fling core logic (UNCHANGED)
+local function TouchFlingLoop()
+    local Player1 = Players.LocalPlayer
+    local character, hrp, baseV
+
+    while TouchFlingEnabled do
+        RunService.Heartbeat:Wait()
+        character = Player1.Character
+        hrp = character and character:FindFirstChild("HumanoidRootPart")
+
+        if hrp then
+            baseV = hrp.Velocity
+
+            -- When strength is extremely large, math.huge can appear – clamp just at the
+            -- math operation level so the script doesn't error, but we DO NOT clamp
+            -- TouchFlingStrength itself.
+            local s = TouchFlingStrength
+            if s == math.huge then
+                s = 1e6 -- treat infinity as a huge number for the actual physics step
+            end
+
+            local horiz = Vector3.new(baseV.X, 0, baseV.Z)
+            if horiz.Magnitude > 0 then
+                horiz = horiz.Unit * (horiz.Magnitude * s)
+            end
+
+            local verticalBoost = 5000 * s
+
+            -- Prevent NaN/inf from breaking physics: if values go crazy, just skip that frame
+            if horiz.X == horiz.X and horiz.Y == horiz.Y and horiz.Z == horiz.Z and
+               verticalBoost == verticalBoost then
+                hrp.Velocity = horiz + Vector3.new(0, verticalBoost, 0)
+
+                RunService.RenderStepped:Wait()
+                hrp.Velocity = baseV
+
+                RunService.Stepped:Wait()
+            else
+                -- bad math (NaN/inf), just restore and wait
+                hrp.Velocity = baseV
+                RunService.Stepped:Wait()
+            end
+        end
+    end
+end
+
+local function EnableTouchFling()
+    if TouchFlingEnabled then return end
+    TouchFlingEnabled = true
+
+    TouchFlingConnection = task.spawn(function()
+        TouchFlingLoop()
+    end)
+
+    Message("Touch Fling", "Touch Fling enabled.", 3)
+end
+
+local function DisableTouchFling()
+    if not TouchFlingEnabled then return end
+    TouchFlingEnabled = false
+    TouchFlingConnection = nil
+    Message("Touch Fling", "Touch Fling disabled.", 3)
+end
+
+TouchFlingTab:CreateToggle({
+    Name         = "Enable Touch Fling",
+    CurrentValue = false,
+    Flag         = "DestinyTouchFlingToggle",
+    Callback     = function(Value)
+        -- Keep logic in sync with UI
+        if Value then
+            EnableTouchFling()
+        else
+            DisableTouchFling()
+        end
+    end,
+})
+
+-- ////////////////////////////////////////////////////////////////
+-- //  KEYBINDS TAB (CONFIGURABLE TOUCH FLING + TP TOOL)
+-- ////////////////////////////////////////////////////////////////
+
+KeybindsTab:CreateSection("Keybinds")
+
+-- Stored as Enum.KeyCode. Defaults (can be changed via UI below):
+local TouchFlingKey = Enum.KeyCode.T       -- default key to toggle Touch Fling
+local TpToolKey     = Enum.KeyCode.Y       -- default key to execute Teleport Tool
+
+-- Return a valid KeyCode from a string, or nil if invalid/forbidden.
+local function StringToKeyCode(str)
+    if not str or str == "" then return nil end
+    str = string.upper(str)
+
+    -- Disallow K completely (used by Rayfield UI toggle)
+    if str == "K" then
+        return nil
+    end
+
+    -- Try direct mapping for single letters and digits
+    if #str == 1 then
+        -- Letters
+        if str:match("%a") then
+            local ok, kc = pcall(function()
+                return Enum.KeyCode[str]
+            end)
+            if ok and kc ~= nil then
+                return kc
+            end
+        end
+        -- Digits 0-9
+        if str:match("%d") then
+            local ok, kc = pcall(function()
+                return Enum.KeyCode["D" .. str]
+            end)
+            if ok and kc ~= nil then
+                return kc
+            end
+        end
+    end
+
+    -- Try full Enum name, e.g. "LEFTSHIFT", "SPACE", etc.
+    local ok, kc = pcall(function()
+        return Enum.KeyCode[str]
+    end)
+    if ok and kc ~= nil and kc ~= Enum.KeyCode.K then
+        return kc
+    end
+
+    return nil
+end
+
+local function KeyCodeToString(kc)
+    if not kc then return "None" end
+    return kc.Name or tostring(kc)
+end
+
+-- Input to change Touch Fling keybind
+KeybindsTab:CreateInput({
+    Name                     = "Set Touch Fling Key",
+    PlaceholderText          = "Example: T, Z, 1, SPACE",
+    RemoveTextAfterFocusLost = false,
+    Callback                 = function(Text)
+        local kc = StringToKeyCode(Text)
+        if not kc then
+            Message("Keybinds", "Invalid or blocked key. Do not use 'K'.", 3)
+            return
+        end
+        TouchFlingKey = kc
+        Message("Keybinds", "Touch Fling key set to " .. KeyCodeToString(TouchFlingKey), 2)
+    end,
+})
+
+-- Input to change Teleport Tool keybind
+KeybindsTab:CreateInput({
+    Name                     = "Set Teleport Tool Key",
+    PlaceholderText          = "Example: Y, G, 2, SPACE",
+    RemoveTextAfterFocusLost = false,
+    Callback                 = function(Text)
+        local kc = StringToKeyCode(Text)
+        if not kc then
+            Message("Keybinds", "Invalid or blocked key. Do not use 'K'.", 3)
+            return
+        end
+        TpToolKey = kc
+        Message("Keybinds", "Teleport Tool key set to " .. KeyCodeToString(TpToolKey), 2)
+    end,
+})
+
+-- Input capture (debugged so it always syncs Touch Fling with the toggle)
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+    local key = input.KeyCode
+
+    -- Touch Fling toggle
+    if key == TouchFlingKey then
+        if TouchFlingEnabled then
+            DisableTouchFling()
+            -- reflect into Rayfield toggle so UI matches state
+            local flag = Rayfield.Flags["DestinyTouchFlingToggle"]
+            if flag and flag.Set then
+                flag:Set(false)
+            end
+        else
+            EnableTouchFling()
+            local flag = Rayfield.Flags["DestinyTouchFlingToggle"]
+            if flag and flag.Set then
+                flag:Set(true)
+            end
+        end
+
+    -- Teleport Tool keybind
+    elseif key == TpToolKey then
+        pcall(function()
+            loadstring(game:HttpGet("https://rscripts.net/raw/tp-tool-or-universal-all-executors-support_1726409972061_KYsl77ZQuH.txt"))()
+        end)
+        Message("Teleport Tool", "Teleport tool script executed via keybind.", 3)
     end
 end)
 
 
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "DiscountedWinterGui"
-screenGui.ResetOnSpawn = false
-screenGui.Parent = playerGui
+-- ////////////////////////////////////////////////////////////////
+-- //  NECESSITIES TAB – ANTI-AFK, REJOIN, SERVER HOP, TP TOOL
+-- ////////////////////////////////////////////////////////////////
 
-local textLabel = Instance.new("TextLabel")
-textLabel.Parent = screenGui
-textLabel.Size = UDim2.new(0.4, 0, 0.1, 0)
-textLabel.Position = UDim2.new(0.3, 0, 0.45, 0)
-textLabel.BackgroundTransparency = 0.3
-textLabel.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-textLabel.BorderSizePixel = 0
+NecessitiesTab:CreateSection("Anti-AFK")
 
-textLabel.Text = "Discounted - winter"
-textLabel.TextScaled = true
-textLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-textLabel.Font = Enum.Font.GothamBold
-
-
-local function safeSetCore(core, data)
-    local success
-    repeat
-        success = pcall(function()
-            StarterGui:SetCore(core, data)
+local function disconnectAntiAFK()
+    if AntiAFK_Connection then
+        pcall(function()
+            AntiAFK_Connection:Disconnect()
         end)
-        if not success then
-            task.wait(0.5)
-        end
-    until success
+        AntiAFK_Connection = nil
+    end
 end
 
-spawn(function()
-    safeSetCore("ChatMakeSystemMessage", {
-        Text = "Discounted - winter";
-        Color = Color3.fromRGB(0, 255, 255);
-        Font = Enum.Font.SourceSansBold;
-        TextSize = 18;
-    })
-end)
+local function enableAntiAFK()
+    disconnectAntiAFK()
+
+    local localPlayer = Players.LocalPlayer
+    if not localPlayer then
+        Message("Anti-AFK", "LocalPlayer not found.", 3)
+        return
+    end
+
+    local ok, connOrErr = pcall(function()
+        return localPlayer.Idled:Connect(function()
+            local vu_success, vu = pcall(function()
+                return game:GetService("VirtualUser")
+            end)
+            if vu_success and vu then
+                pcall(function()
+                    vu:Button2Down(Vector2.new(0, 0), Workspace.CurrentCamera and Workspace.CurrentCamera.CFrame or CFrame.new())
+                    task.wait(0.1)
+                    vu:Button2Up(Vector2.new(0, 0), Workspace.CurrentCamera and Workspace.CurrentCamera.CFrame or CFrame.new())
+                end)
+            end
+
+            pcall(function()
+                local cam = Workspace.CurrentCamera
+                if cam then
+                    cam.CFrame = cam.CFrame * CFrame.Angles(0, math.rad(0.1), 0)
+                end
+            end)
+        end)
+    end)
+
+    if ok and connOrErr then
+        AntiAFK_Connection = connOrErr
+        Message("Anti-AFK", "Anti-AFK enabled.", 3)
+    else
+        AntiAFK_Connection = nil
+        Message("Anti-AFK", "Failed to hook Anti-AFK (executor or game may block it).", 4)
+    end
+end
+
+local function disableAntiAFK()
+    disconnectAntiAFK()
+    Message("Anti-AFK", "Anti-AFK disabled.", 3)
+end
+
+NecessitiesTab:CreateToggle({
+    Name         = "Enable Anti-AFK",
+    CurrentValue = false,
+    Flag         = "DestinyAntiAFK",
+    Callback     = function(Value)
+        AntiAFK_Enabled = Value
+
+        if AntiAFK_Enabled then
+            enableAntiAFK()
+        else
+            disableAntiAFK()
+        end
+    end,
+})
+
+NecessitiesTab:CreateSection("Server Utilities")
+
+NecessitiesTab:CreateButton({
+    Name     = "Server - Rejoin",
+    Callback = function()
+        local placeId = game.PlaceId
+        local jobId   = game.JobId
+        Message("Server", "Rejoining current server...", 3)
+
+        task.delay(0.5, function()
+            TeleportService:TeleportToPlaceInstance(placeId, jobId, Player)
+        end)
+    end,
+})
+
+NecessitiesTab:CreateButton({
+    Name     = "Server - Hop",
+    Callback = function()
+        Message("Server", "Attempting to hop to a different server...", 3)
+
+        task.spawn(function()
+            pcall(function()
+                local placeId = game.PlaceId
+                local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100", placeId)
+                local data = HttpService:JSONDecode(game:HttpGet(url))
+
+                if data and data.data then
+                    for _, server in ipairs(data.data) do
+                        if server.playing < server.maxPlayers and server.id ~= game.JobId then
+                            TeleportService:TeleportToPlaceInstance(placeId, server.id, Player)
+                            return
+                        end
+                    end
+                end
+
+                Message("Server", "No different public server found to hop to.", 4)
+            end)
+        end)
+    end,
+})
+
+NecessitiesTab:CreateButton({
+    Name     = "Teleport Tool (Load)",
+    Callback = function()
+        pcall(function()
+            loadstring(game:HttpGet("https://rscripts.net/raw/tp-tool-or-universal-all-executors-support_1726409972061_KYsl77ZQuH.txt"))()
+        end)
+        Message("Teleport Tool", "Teleport tool script executed.", 3)
+    end,
+})
+
+
+-- ////////////////////////////////////////////////////////////////
+-- //  FINAL SETUP
+-- ////////////////////////////////////////////////////////////////
+
+UpdateFlingStatus()
+Message("Loaded", "Enjoy @winter9305's Script", 3)
